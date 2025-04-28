@@ -1,0 +1,308 @@
+
+# This script contains information on building a tree of phasmids to place LHISI in
+# A previous version of this analysis tried to use TOAST. TOAST was poorly documented
+# and buggy. So instead, this analysis uses orthograph, which I have installed on
+# Fisher, to map all the phasmid transcriptomes from the phylogenomics paper to a
+# set of custom orthogroups. These clusters are then used to build concatenated alignments,
+# and then we use IQtree to build a tree.
+
+HOME_DIR=/Volumes/Alter/LHISI
+WORKING_DIR=${HOME_DIR}/Analyses/TreeBuilding
+DATA_DIR=${HOME_DIR}/Data/
+REF_DIR=${HOME_DIR}/References
+ORTH_DIR=${HOME_DIR}/Orthograph
+
+cd ${WORKING_DIR}
+
+# In the ./fasta/ directory is the fasta files for all the transcriptomes in Simon et al.
+# Phasmids and outgroups. We also have Dryococelus_australis.fasta in there. This is a
+# filtered transcriptome, assembled with Trinity, then mapped to the reference genome with
+# hisat2 to remove exogenous stuff. Then everything is clustered with CD-HIT-EST to remove
+# identical stuff, 0.95 threshold. This is pretty crude filtering but the main aim is to reduce
+# the search space so orthograph actually finishes.
+
+# Make the orthodb database. ${WORKING_DIR}/Orthologs contains the official gene sets used by 
+# Simon et al. to construct their alignments. The orthodb database is a shell configuration
+# file which is used to set up the database. It has to have some species in it so we use Dryococelus_australis.fasta
+
+conda activate orthograph_env
+
+${ORTH_DIR}/orthograph-manager --create --configfile orthograph_temp.conf 
+# Press y
+
+# Load peptides
+
+${ORTH_DIR}/orthograph-manager \
+--load-ogs-peptide Orthologs/corresp-EDAN_cleaned.protein.fas \
+--ogs-version 1 --ogs-taxon-name "Ephemera danica" \
+--configfile orthograph_temp.conf
+
+${ORTH_DIR}/orthograph-manager \
+--load-ogs-peptide Orthologs/corresp-LFUL_cleaned.protein.fas \
+--ogs-version 1 --ogs-taxon-name "Ladona fulva" \
+--configfile orthograph_temp.conf
+
+${ORTH_DIR}/orthograph-manager \
+--load-ogs-peptide Orthologs/corresp-RPRO_cleaned.protein.fas \
+--ogs-version 1 --ogs-taxon-name "Rhodnius prolixus" \
+--configfile orthograph_temp.conf
+
+${ORTH_DIR}/orthograph-manager \
+--load-ogs-peptide Orthologs/corresp-ZNEV_cleaned.protein.fas \
+--ogs-version 1 --ogs-taxon-name "Zootermopsis nevadensis" \
+--configfile orthograph_temp.conf
+
+# Load nucleotides
+
+${ORTH_DIR}/orthograph-manager \
+--load-ogs-nucleotide Orthologs/corresp-EDAN_cleaned.CDS.fas \
+--ogs-version 1 --ogs-taxon-name "Ephemera danica" \
+--configfile orthograph_temp.conf
+
+${ORTH_DIR}/orthograph-manager \
+--load-ogs-nucleotide Orthologs/corresp-LFUL_cleaned.CDS.fas \
+--ogs-version 1 --ogs-taxon-name "Ladona fulva" \
+--configfile orthograph_temp.conf
+
+${ORTH_DIR}/orthograph-manager \
+--load-ogs-nucleotide Orthologs/corresp-RPRO_cleaned.CDS.fas \
+--ogs-version 1 --ogs-taxon-name "Rhodnius prolixus" \
+--configfile orthograph_temp.conf
+
+${ORTH_DIR}/orthograph-manager \
+--load-ogs-nucleotide Orthologs/corresp-ZNEV_cleaned.CDS.fas \
+--ogs-version 1 --ogs-taxon-name "Zootermopsis nevadensis" \
+--configfile orthograph_temp.conf
+
+# Load ortholog set into database
+
+${ORTH_DIR}/orthograph-manager \
+Orthologs/table_OGs_OrthoDB7_orthograph.txt \
+--configfile orthograph_temp.conf
+# Enter OGS IDs
+
+# Prepapre database for search
+${ORTH_DIR}/orthograph-analyzer --prepare --configfile orthograph_temp.conf
+
+# Now we run the snakemake script. This script creates config files for all fasta
+# files and runs independent instances of the orthograph pipeline. Then once they're
+# all done it aggregates them and creates one fasta per COG, containing the sequences
+# from all species for which COG was identified. To get this to run with selenocysteines
+# in the proteins fasta, I have modified line 1126 of orthograph-analyzer, to include
+# the --anysymbol option for mafft.
+
+ls fasta/ | sed 's/\.fasta//g' > species_list
+snakemake -s orthograph_snakefile --config list=species_list -j20
+rm *_*_*.conf
+
+conda deactivate
+
+# Now in a separate folder named aa_summarized and nt_summarized we have individual fasta files for all COG
+# We are only dealing with AA alignments. We're not doing anything especially stringent here
+
+cd aa_summarized
+
+# Batch rename
+# This is an awful clunky loop which I should replace
+
+for f in $(echo *fa)
+do
+
+# Remove extraneous crap from fasta name
+bioawk -c fastx '{print ">"$name"\n"$seq}' ${f} > tmp
+mv tmp ${f}
+
+# Make table of oldname\tnewnamne
+grep ">" ${f} | cut -d "|" -f2 > tmp
+grep ">" ${f} | sed 's/>//g' > tmp2
+paste tmp2 tmp > rename.txt
+
+# Run renamer script
+sh /home/oliver/fastaRename.sh ${f} rename.txt
+
+rm tmp* rename.txt
+
+mv renamed_${f} ${f}
+
+done
+
+# Then we select only the phasmids and one outgroup taxon, the Embiopterans
+# We can check the monophyly of the two groups later as a check of alignment quality
+
+for f in $(echo *fa)
+do
+seqtk subseq ${f} ../SpeciesForAnalysis > temp
+mv temp ${f}
+done
+
+# We may need to convert selenocysteines to X and NNN in nt
+# There is no selenocysteine in here
+#for f in $(echo *fa) ; do grep U ${f} > seleno.txt ; done
+#wc -l seleno.txt
+
+# Then align
+
+mkdir alignment
+for f in $(ls -a | grep fa | cut -d "." -f1)
+do
+mafft --localpair --maxiterate 1000 --thread 20 ${f}.aa.summarized.fa > alignment/${f}_raw_alignment.fa
+done
+
+# Remove poorly aligned regions of each alignment
+# We're going to try TrimAl
+
+cd alignment
+
+for f in $( ls | grep alignment.fa | cut -d "_" -f1)
+do
+~/trimal/source/trimal \
+-in ${f}_raw_alignment.fa \
+-out ${f}_trimmed_alignment.fa \
+-automated1
+# This automated1 mode is "optimised for ML tree reconstruction" apparently
+# It remove badly aligned positions, then removes any taxon that is only gaps after this
+done
+
+# Now zip and save the unfiltered alignments
+tar -cvzf raw_aa_alignments.tar.gz *raw_alignment.fa ; rm *raw_alignment.fa
+
+# Now, remove any sequences from alignments that are only short fragments
+# Let's say we want a species to have residues for 50 % of the total length at least to be included
+
+for f in $(ls | grep alignment.fa | cut -d "_" -f1)
+do
+
+# How many sites
+TOTAL=$(bioawk -c fastx '{print length($seq)}' ${f}_trimmed_alignment.fa | head -n 1)
+
+# How many blanks
+bioawk -c fastx '{print $name"\t"$seq}' ${f}_trimmed_alignment.fa | \
+sed "s/[A-Za-z_]//g" | \
+sed 's/[[:blank:]]//g' | \
+awk -v total=${TOTAL} '{print length/total}' > missing_chars
+
+# Paste names and blanks together and filter by < 50 % missing characters
+bioawk -c fastx '{print $name}' ${f}_trimmed_alignment.fa > names
+paste names missing_chars | awk '$2 <= 0.5 {print $1}' > good.names
+
+# Use list of names to filter alignment
+seqtk subseq ${f}_trimmed_alignment.fa good.names > ${f}_trimmed_filtered_alignment.fa
+
+done
+
+rm *trimmed_alignment.fa missing_chars names good.names
+
+# Next step is to select only COGs with high representation (>80% / >35/44) (and definitely present in D.australis
+# This section could be made more rigourous, refer to the phasmid paper on specific details
+
+# Make a table with values for D. australis rep and total seqs
+rm representation.txt
+for f in $(ls | grep trimmed_filtered_alignment.fa | cut -d "_" -f1)
+do
+DR=$(cat ${f}_trimmed_filtered_alignment.fa | grep Dryococelus | wc -l)
+REP=$(cat ${f}_trimmed_filtered_alignment.fa | grep ">" | wc -l)
+echo -e "${f}\t${DR}\t${REP}" >> representation.txt
+done
+
+# Select files with D. australis in them and also >35 seqs
+awk -v COV=${f} '$2 == 1 && $3 > 35 {print $1"_trimmed_filtered_alignment.fa"}' representation.txt > low_missing_alignments.txt
+awk -v COV=${f} '$2 == 0 || $3 <= 35 {print $1"_trimmed_filtered_alignment.fa"}' representation.txt > high_missing_alignments.txt
+# With > 35 seqs, including Dryococelus australis, we get 774 alignments, that is not too shabby at all
+
+# Zip and save the alignments we lose to filtering, then remove the files
+tar -cvzf high_missing_aa_alignments.tar.gz -T high_missing_alignments.txt
+xargs -a high_missing_alignments.txt -d'\n' rm
+
+# How many do we have? If it's a reasonable amount, let's download them and eyeball them
+# After eyeballing, there are a few things to be redone
+
+# Now we run an Rscript to build NJ trees of the alignments
+# This also computes several metrics and classifies alignments as "suspicious"
+# There are 94 suspicious alignments, these can possibly be fixed by removing obvious outliers
+# This is to be done at a later date
+
+# Trees are inspected with R and Geneious NJ algorithms
+# Marked for treatment
+# COGs that are paralogs or have very low information content are listed in COGsForRemoval.txt
+
+mkdir final_alignments
+cp *fa final_alignments
+cd final_alignments
+xargs -a ${WORKING_DIR}/COGsForRemoval.txt -d'\n' rm
+
+# Some trees only need a few taxa removed
+# This is done manually
+
+# Then concatenate (keeping record of boundaries in phylip or nexus or whatever
+# We use the catsequences cmd utility https://github.com/ChrisCreevey/catsequences
+# This is great because it parses names automatically and creates a partition file
+# We modify this file only slightly to make it iqtree compatible
+
+ls *alignment.fa > list
+catsequences list
+mv allseqs.fas FullAlignments_AllSpecies.fas
+sed 's/_trimmed_filtered_alignment\.fa//g' allseqs.partitions.txt | sed 's/^/protein, /g' | sed 's/\t/ /g' | sed 's/;//g' > FullAlignments_AllSpecies.partition
+rm list
+
+# Now make subsets which exclue the malagasy clade, Bacillus+Phyllium, and both
+# So we have four full datasets, pruned of potentially problematic taxa
+# We also only keep phasmids, Timema is a good enough outgroup on its own
+
+grep "Phasmatodea" ${WORKING_DIR}/taxonomy_table.txt | cut -f6 > Phasmids.txt
+grep -v "Paranisacantha\|Acrioptera\|Spathomorpha\|Antongilia" ${WORKING_DIR}/taxonomy_table.txt | grep "Phasmatodea" | cut -f6 > MalagasyRemoved.txt
+grep -v "Bacillus\|Phyllium" ${WORKING_DIR}/taxonomy_table.txt | grep "Phasmatodea" | cut -f6 > BacPhylRemoved.txt
+grep -v "Paranisacantha\|Acrioptera\|Spathomorpha\|Antongilia\|Bacillus\|Phyllium" ${WORKING_DIR}/taxonomy_table.txt | grep "Phasmatodea" | cut -f6 > BothRemoved.txt
+
+seqtk subseq FullAlignments_AllSpecies.fas Phasmids.txt > PhasmidAlignments.fas
+seqtk subseq FullAlignments_AllSpecies.fas MalagasyRemoved.txt > PhasmidAlignments_MalagasyRemoved.fas
+seqtk subseq FullAlignments_AllSpecies.fas BacPhylRemoved.txt > PhasmidAlignments_BacPhylRemoved.fas
+seqtk subseq FullAlignments_AllSpecies.fas BothRemoved.txt > PhasmidAlignments_BothRemoved.fas
+
+# Now zip all the unconcatenated fasta files
+
+tar -cvzf SeparateAlignments.tar.gz *_alignment.fa
+rm *_alignment.fa
+
+# Convert all multifasta files to nexus
+# I cannot get this script to work on the server, but it does work, just a server end bash configuration issue
+
+for f in $(echo Phasmid*fas) ; do sh ${WORKING_DIR}/fas2nex.sh ${f} ; done
+
+# Then run iqtree! Finally
+
+conda activate iqtree_env
+
+iqtree -s PhasmidAlignments.nex -p FullAlignments_AllSpecies.partition -m MFP+MERGE -B 1000 -nt 20
+iqtree -s PhasmidAlignments_BacPhylRemoved.nex -p FullAlignments_AllSpecies.partition -m MFP+MERGE -B 1000 -nt 20
+iqtree -s PhasmidAlignments_MalagasyRemoved.nex -p FullAlignments_AllSpecies.partition -m MFP+MERGE -B 1000 -nt 20
+iqtree -s PhasmidAlignments_BothRemoved.nex -p FullAlignments_AllSpecies.partition -m MFP+MERGE -B 1000 -nt 20
+
+done
+
+# Final step is to make a final table of per-taxon missingness
+
+grep -v ">" PhasmidAlignments.fas| awk '{print gsub(/-/,"",$1)}' > missing
+grep -v ">" PhasmidAlignments.fas| awk '{print gsub(/./,"",$1)}' > total 
+grep ">" PhasmidAlignments.fas| sed 's/>//g' > names
+
+paste names total missing | awk '{print $0"\t"$3/$2}' > tmp
+echo -e "name\ttotal\tmissing\tperc" > missingness.txt
+cat tmp >> missingness.txt
+rm tmp missing total names
+
+# Now go through and zip all other files
+
+cd ..
+tar -cvzf trimmed_filtered_alignments.tar.gz *trimmed_filtered_alignment.fa
+rm *trimmed_filtered_alignment.fa
+
+# All raw aa data already contained in zip file in working directory
+# So just remove them
+
+cd ..
+rm *.aa.summarized.fa
+
+# Looking at this tree, the answer we get out is that D. australis is sister to E. tiaratum with 100 bootstrap support
+# This makes sense, if anyone asks we can make this finding more robust, but I'm happy to leave it there
+
+

@@ -1,0 +1,48 @@
+SPECIES = [line.strip() for line in open(config.get("list")).readlines()]
+
+rule all:
+    input:
+      "/home/oliver/TreeBuilding/report.txt"
+
+rule orthograph_config:
+    input:
+      fasta="/home/oliver/TreeBuilding/fasta/{species}.fasta",
+      template="/home/oliver/TreeBuilding/orthograph.conf"
+    output:
+      conf="orthograph_{species}.conf"
+    threads:
+      1
+    shell:
+      """
+      sed "s/species_goes_here/{wildcards.species}/g" {input.template} > {output.conf}
+      """
+
+rule orthograph_analyzer:
+    input:
+      "orthograph_{species}.conf"
+    output:
+      "/home/oliver/TreeBuilding/orthograph_out/{species}/summary.txt"
+    log:
+      analyzer="/home/oliver/TreeBuilding/orthograph_out/{species}/analyzer.log",
+      reporter="/home/oliver/TreeBuilding/orthograph_out/{species}/reporter.log"
+    params:
+    threads:
+      1
+    shell:
+      """
+      /home/oliver/Orthograph/orthograph-analyzer -c {input} &> {log.analyzer}
+      /home/oliver/Orthograph/orthograph-reporter -c {input} &> {log.reporter}
+      """
+
+rule orthograph_summarise:
+    input:
+      expand("/home/oliver/TreeBuilding/orthograph_out/{species}/summary.txt",species=SPECIES)
+    output:
+      "/home/oliver/TreeBuilding/report.txt"
+    threads:
+      1
+    shell:
+      """
+      perl /home/oliver/Orthograph/summarize_orthograph_results.pl -i /home/oliver/TreeBuilding/orthograph_out -o /home/oliver/TreeBuilding
+      echo all_done > {output}
+      """
